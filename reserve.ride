@@ -1,0 +1,589 @@
+{-# STDLIB_VERSION 5 #-}
+{-# CONTENT_TYPE DAPP #-}
+{-# SCRIPT_TYPE ACCOUNT #-}
+
+func getI(key: String) = getInteger(this, key)
+func getS(key: String) = getString(this, key)
+func getSV(key: String) = getString(this, key).value()
+
+func throwIf(condition: Boolean, error: String) = if condition then throw(error) else true
+func writeInt(key: String, value: Int) =
+    if(value < 0)
+        then throw("writing negative value " + value.toString() + " for key " + key)
+    else IntegerEntry(key, value)
+
+func changeBy(key: String, value: Int) = key.writeInt(key.getI().valueOrElse(0) + value)
+func writeString(key: String, value: String) = StringEntry(key, value)
+
+func fractionCeil(value: Int, numerator: Int, denominator: Int) = {
+  let cand = fraction(value, numerator, denominator)
+  let D = 3037000499
+  let exact = ((cand % D) * (denominator % D)) % D == ((value % D) * (numerator % D)) % D
+  if(exact) then cand else cand + 1
+}
+
+let BlocksPerYear = 525600
+let RBase = 10000000000000000#00
+let factorsBase = 1000
+
+## <Config>
+let assetIdStore = "assetId"
+let mainStore = "main"
+let reserveFactorStore = assetIdStore.getSV() + "_ReserveFactor"
+let collateralFactorStore = assetIdStore.getSV() + "_CollateralFactor"
+let liquidationThresholdStore = assetIdStore.getStringValue() + "_LiquidationThreshold"
+let overlapChargeStore = "account_health_overlap"
+let liquidationPenaltyStore = assetIdStore.getStringValue() + "_LiquidationPenalty"
+
+## <Local>
+let configAddressStore = "configAddress"
+let oracleStore = "oracleAddress"
+let aTokenIdStore = "aTokenId"
+let aTokenNameStore = "aTokenName"
+let aTokenCirculationStore = "aTokenCirculation"
+let lastUpdateHeightStore = "lastUpdateHeight"
+let totalDebtStore = "totalBorrow"
+let totalDepositStore = "totalDeposit"
+let totalReserveStore = "totalReserve"
+let indexStore = "storedIndex"
+let aTokenDecimalsStore = "aTokenDecimals"
+## </Local>
+
+func aTokenBalanceStore(userAddress: String) = userAddress + "_aTokenBalance"
+func debtStore(userAddress: String) = userAddress + "_debt"
+func debtIndexStore(userAddress: String) = userAddress + "_index"
+func useAsCollateralStore(userAddress: String) = userAddress + "_useAsCollateral"
+
+let assetId = {
+  let id = assetIdStore.getS().valueOrErrorMessage("no assetId")
+  if id == "WAVES" then unit else id.fromBase58String()
+}
+
+let assetIdStr = match assetId {
+  case bv:ByteVector => bv.toBase58String()
+  case u:Unit => "WAVES"
+}
+
+func getBalance(addressOrAlias: Address|Alias, assetId: ByteVector|Unit) = match (assetId) {
+  case bv:ByteVector => assetBalance(addressOrAlias, bv)
+  case u:Unit => wavesBalance(addressOrAlias).available
+}
+
+let assetDecimals = aTokenDecimalsStore.getI().valueOrErrorMessage("no assetDecimals")
+let configAddress = configAddressStore
+  .getS().valueOrErrorMessage("no configAddress")
+  .addressFromString().valueOrErrorMessage("invalid config address")
+
+
+##Checks
+
+func opAllowed(op:String) = {
+   let aid = assetIdStore.getS().valueOrErrorMessage("no assetId")
+   match invoke(configAddress,"opAllowed", [aid, op], []) {
+       case b: Boolean => if(b) then true else throw("not allowed")
+       case _ => throw("opAllowed: unexpected result type")
+   }
+}
+
+func mainOnly(i: Invocation) = if i.caller != configAddress.getString(mainStore).valueOrErrorMessage("no main in config")
+  .addressFromString().valueOrErrorMessage("invalid main address") then throw("only main can do") else true
+
+func isAssetIdOrWaves(value: String)=
+  if value != "WAVES" && value.fromBase58String() == "".fromBase58String() then throw("invalid assetId") else true
+
+let notInitialized = throwIf(isDefined(assetIdStore.getS()), "already initialized")
+
+## DON'T CHANGE THE LINES -- HEIGHT MOCKED IN TESTS IN `oracle-wrapper-mock.ride`
+let maybeOracleAddress = match oracleStore.getS() {
+    case s: String => addressFromString(s)
+    case _ => unit
+}
+let oraclePrice = match invoke(maybeOracleAddress.valueOrErrorMessage("no oracle"), "price", [assetIdStore.getSV()], []) {
+    case i: Int => i
+    case _ => throw("bad oracle data")
+}
+let HEIGHT = height
+##
+
+let lastUpdateHeight = lastUpdateHeightStore.getI().valueOrErrorMessage("no lastUpdateHeight")
+let aTokenId = aTokenIdStore.getS().valueOrErrorMessage("no aTokenId").fromBase58String()
+let aTokenCirculation = aTokenCirculationStore.getI().valueOrElse(0)
+let ABCD = {
+  let id = assetIdStore.getSV()
+  (
+    configAddress.getIntegerValue(id + "_APoint"),
+    configAddress.getIntegerValue(id + "_BPoint"),
+    configAddress.getIntegerValue(id + "_CPoint"),
+    configAddress.getIntegerValue(id + "_DPoint")
+  )
+}
+
+let reserveFactor =
+  configAddress.getInteger(reserveFactorStore).valueOrErrorMessage("no reserveFactor")
+let collateralFactor =
+  configAddress.getInteger(collateralFactorStore).valueOrErrorMessage("no collateralFactor")
+let liquidationThreshold =
+  configAddress.getInteger(liquidationThresholdStore).valueOrErrorMessage("no liquidationThreshold")
+let accountHealthOverlap =
+    configAddress.getInteger(overlapChargeStore).valueOrErrorMessage("no overlapCharge")
+let liquidationPenalty =
+  configAddress.getInteger(liquidationPenaltyStore).valueOrErrorMessage("no liquidationPenalty")
+
+let storedTotalDeposit = totalDepositStore.getI().valueOrElse(0)
+let storedTotalReserve = totalReserveStore.getI().valueOrElse(0)
+let storedTotalDebt = totalDebtStore.getI().valueOrElse(0)
+let storedIndex = indexStore.getI().valueOrElse(RBase)
+let utilization = if storedTotalDeposit > 0 then fraction(storedTotalDebt, factorsBase, storedTotalDeposit) else 0
+
+let apr = {
+  let (a,b,c,d) = ABCD
+
+  let lineAC = fraction(a - c, utilization, -b) + a
+  let lineCD = fraction(c - d, utilization - b, b - factorsBase) + c
+
+ if utilization == 0 then a
+       else if utilization == b then c
+       else if (utilization < b || b == factorsBase) then lineAC
+       else lineCD
+}
+
+let apy = if(storedTotalDeposit ==0) then 0 else
+    fraction(fraction(storedTotalDebt,apr , storedTotalDeposit), (factorsBase-reserveFactor), factorsBase)
+
+let currentIndex = {
+  let bpr = fractionCeil(apr, RBase, BlocksPerYear * factorsBase)
+  fractionCeil(storedIndex, RBase + bpr * (HEIGHT - lastUpdateHeight), RBase)
+}
+
+func liquidityCheck(amount: Int, max: Int, err: String) =
+ if amount > max then throw("not enough liquidity: " + err) else true
+
+func storedUserDebt(userAddress: String) = debtStore(userAddress).getI().valueOrElse(0)
+func currentUserDebt(userAddress: String) = {
+  let v = storedUserDebt(userAddress)
+  if( v == 0 ) then 0 else
+      let storedUserIndex = debtIndexStore(userAddress).getI().valueOrErrorMessage("has debt but does not have index")
+      fraction(v, currentIndex, storedUserIndex)
+}
+
+let currentTotalDebt = fraction(storedTotalDebt, currentIndex, storedIndex)
+let addedDebt = currentTotalDebt - storedTotalDebt
+let addedDeposit = fraction(addedDebt, factorsBase - reserveFactor, factorsBase)
+let currentTotalDeposit = storedTotalDeposit + addedDeposit
+let currentTotalReserve = storedTotalReserve + addedDebt - addedDeposit
+
+func paymentAmount(i: Invocation, assetId: ByteVector|Unit) = {
+  let p = i.payments[0].amount
+  if p <= 0 then throw("Payment is less than min allowed amount") else
+  if i.payments[0].assetId != assetId then throw("bad asset attached: required " + assetIdStr) else p
+}
+
+func syncTotals(additionalDeposit:Int, additionalDebt:Int, additionalReserve: Int, keepAtBalance: Int) =
+ {
+   let actualBalance = match assetId {
+     case aid: ByteVector => assetBalance(this,aid)
+     case _ => wavesBalance(this).available
+   }
+   strict stakingAction =
+        if(actualBalance == keepAtBalance) then unit else
+        let stakingEnabled = configAddress.getBoolean("staking_enabled_" + assetIdStr).valueOrElse(false)
+        if(!stakingEnabled) then unit else
+          let stakingAddress = configAddress.getString("staking_config_" + assetIdStr)
+                              .valueOrErrorMessage("no staking address for " + assetIdStr)
+                              .addressFromString()
+                              .valueOrErrorMessage("bad staking address for " + assetIdStr)
+          if(actualBalance > keepAtBalance)
+              then invoke(stakingAddress, "put", [],[AttachedPayment(assetId, actualBalance - keepAtBalance)])
+              else invoke(stakingAddress, "get", [(keepAtBalance - actualBalance)],[])
+     [
+      indexStore.writeInt(currentIndex),
+      lastUpdateHeightStore.writeInt(HEIGHT),
+      totalDepositStore.writeInt(currentTotalDeposit + additionalDeposit),
+      totalDebtStore.writeInt(currentTotalDebt + additionalDebt),
+      totalReserveStore.writeInt(currentTotalReserve + additionalReserve)
+    ]
+ }
+func pow10(n: Int) = if (n==6) then 1000000 else if(n==8) then 100000000 else throw("bad decimals: " + n.toString())
+
+func assetToUsd(amount: Int) =
+  fraction(amount, oraclePrice, pow10(assetDecimals))
+
+func usdToAsset(amount: Int) =
+  fraction(amount, pow10(assetDecimals), oraclePrice)
+
+func aTokenToAsset(aTokenAmount: Int) =
+  if(aTokenAmount == 0) then 0 else
+  if (aTokenCirculation > 0) then
+    fraction(aTokenAmount, currentTotalDeposit, aTokenCirculation)
+    else aTokenAmount # 1 to 1 on init
+
+func assetToAToken(assetAmount: Int) =
+  if(assetAmount == 0) then 0 else
+  if (aTokenCirculation > 0)
+    then fraction(assetAmount, aTokenCirculation, currentTotalDeposit)
+    else assetAmount # 1 to 1 on init
+
+func assetToATokenCeil(assetAmount: Int) =
+  if(assetAmount == 0) then 0 else
+  if (aTokenCirculation > 0)
+    then fractionCeil(assetAmount, aTokenCirculation, currentTotalDeposit)
+    else assetAmount # 1 to 1 on init
+
+func aTokenBalance(address: String) = aTokenBalanceStore(address).getI().valueOrElse(0)
+
+func enableCol(user: String) = BooleanEntry(useAsCollateralStore(user), true)
+func enableColIfNeeded(user: String) = if (currentUserDebt(user) >0) then [enableCol(user)] else []
+
+func collapseUser(address: String, amount: Int) = {
+  let debt = currentUserDebt(address)
+  let deposit = aTokenToAsset(aTokenBalance(address))
+  let maxPossible = min([debt, deposit])
+  let amt =
+       if(amount < -1) then throw("invalid collapse amount") else
+       if(maxPossible ==0 || amount == 0) then throw("nothing to collapse") else
+       if(amount == -1 || amount > maxPossible) then maxPossible else
+       amount
+
+  let removedAtokens = assetToATokenCeil(amt)
+
+  syncTotals(-amt, -amt, 0, 0) ++ [
+    aTokenBalanceStore(address).changeBy(-removedAtokens),
+    aTokenCirculationStore.changeBy(-removedAtokens),
+    debtStore(address).writeInt(debt-amt),
+    debtIndexStore(address).writeInt(currentIndex)
+  ]}
+
+func getConfig() = {
+  let (a,b,c,d) = ABCD
+  "ABCD: " + a.toString() + ";" + b.toString() + ";" + c.toString() + ";" + d.toString() +
+  ", reserveFactor: " + reserveFactor.toString()  +
+  ", collateralFactor: " + collateralFactor.toString() +
+  ", liquidationThreshold: " + liquidationThreshold.toString() +
+  ", liquidationPenalty: " + liquidationPenalty.toString()
+}
+
+func getState() = {
+  "currentTotalDeposit: " + currentTotalDeposit.toString() +
+  ", storedTotalDeposit: " + storedTotalDeposit.toString() +
+  ", currentTotalDebt: " + currentTotalDebt.toString() +
+  ", storedTotalDebt: " + storedTotalDebt.toString() +
+  ", currentTotalReserve: " + currentTotalReserve.toString() +
+  ", storedTotalReserve: " + storedTotalReserve.toString() +
+  ", currentIndex:" + currentIndex.toString() +
+  ", storedIndex: " + storedIndex.toString() +
+  ", lastUpdateHeight: " + lastUpdateHeight.toString() +
+  ", utilization: " + utilization.toString() +
+  ", aTokenCirculation: " + aTokenCirculation.toString() +
+  ", aTokenPrice: " + aTokenToAsset(pow(10, 0, assetDecimals, 0, 0, FLOOR)).toString() +
+  ", APR: " + apr.toString() +
+  ", APY: " + apy.toString()
+  }
+
+func getUserState(user: String) = {
+  let aBalance = aTokenBalance(user)
+  let aBalanceWallet = getBalance(user.addressFromStringValue(), aTokenId)
+  "currentDebt: " + currentUserDebt(user).toString() +
+  ", storedDebt: " + debtStore(user).getI().valueOrElse(0).toString() +
+  ", currentDeposit: " + aTokenToAsset(aBalance).toString() +
+  ", aTokenContractBalance: " + aBalance.toString() +
+  ", aTokenWalletBalance: " + aBalanceWallet.toString() +
+  ", walletStake: " + aTokenToAsset(aBalanceWallet).toString() +
+  ", assetWalletBalance: " + getBalance(user.addressFromStringValue(), assetId).toString() +
+  ", useAsCollateral: " + this.getBoolean(useAsCollateralStore(user)).valueOrElse(true).toString() +
+  ", storedIndex: " + debtIndexStore(user).getI().valueOrElse(0).toString()
+}
+
+
+#TODO remove when possible and use getState instead
+func debugTotals() = {
+  "storedTotalDeposit: " + storedTotalDeposit.toString() +
+  ", storedTotalDebt: " + storedTotalDebt.toString() +
+  ", storedTotalReserve: " + storedTotalReserve.toString() +
+  ", storedIndex: " + storedIndex.toString() +
+  ", lastUpdateHeight: " + lastUpdateHeight.toString() +
+  ", currentTotalDeposit: " + currentTotalDeposit.toString() +
+  ", currentTotalDebt: " + currentTotalDebt.toString() +
+  ", currentTotalReserve: " + currentTotalReserve.toString() +
+  ", currentIndex: " + currentIndex.toString() +
+  ", currentHeight: " + HEIGHT.toString() +
+  ", aTokenCirculation: " + aTokenCirculation.toString() +
+  ", aTokenPrice: " + aTokenToAsset(pow(10, 0, assetDecimals, 0, 0, FLOOR)).toString()
+}
+
+@Callable(i)
+func advise() = ([], "reserveAddress: " + this.toString() + ", " + getConfig() + ", " + getState())
+
+@Callable(i)
+func adviseUser(user: String) = {
+  let currentDebtUsd = assetToUsd(currentTotalDebt)
+  let currentDepositUsd = assetToUsd(currentTotalDeposit)
+  let asCollateral = this.getBoolean(useAsCollateralStore(user)).valueOrElse(true)
+  let effectiveDepositUsd = if(asCollateral) then currentDepositUsd else 0
+  let overlapUsd = min([currentDebtUsd, effectiveDepositUsd])
+  let overlapCharge = fractionCeil(overlapUsd, accountHealthOverlap, factorsBase)
+  let bp = if(currentDebtUsd > effectiveDepositUsd)
+        then 0
+        else fraction(effectiveDepositUsd - currentDebtUsd, collateralFactor, factorsBase)
+  let bpu = if(currentDebtUsd > effectiveDepositUsd)
+        then fraction(currentDebtUsd - effectiveDepositUsd, factorsBase, liquidationThreshold) + overlapCharge
+        else overlapCharge
+  let enriched =
+
+    "reserveAddress: " + this.toString() +
+  ", currentDebtUsd: " + currentDebtUsd.toString() +
+  ", currentDepositUsd: " + currentDepositUsd.toString() +
+  ", bp: " + bp.toString() +
+  ", bpu: " + bpu.toString()
+
+ ([], enriched + ", " + getUserState(user))
+}
+
+@Callable(i)
+func addInterest() = {
+    if(i.payments[0].assetId != assetId) then throw("can't add interest with unrelated token") else
+      syncTotals(i.payments[0].amount, 0, 0, 0)
+}
+
+@Callable(i)
+func addToReserve() = {
+    if(i.payments[0].assetId != assetId) then throw("can't add interest with unrelated token") else
+    syncTotals(0, 0, i.payments[0].amount, 0)
+}
+
+@Callable(i)
+func withdrawFromReserve(amt:Int) = {
+    let admin = configAddress.getStringValue("admin")
+    if(i.caller.toString() != admin) then throw("only admin can do") else
+      syncTotals(0,0, -amt, amt) ++ [
+       ScriptTransfer(admin.addressFromStringValue(),amt, assetId)
+      ]
+}
+
+@Callable(i)
+func forceUpdate() =  {
+    let admin = configAddress.getStringValue("admin")
+    if(i.caller.toString() != admin) then throw("only admin can do") else
+    syncTotals(0,0,0,0)
+}
+
+@Callable(i)
+func initialize(
+    cfgAddress: String,
+    oracleAddr: String,
+    assetIdOrWaves: String,
+    aTokenName: String,
+    aTokenDescription: String,
+    aTokenDecimals: Int) = {
+
+  strict checks = notInitialized && isAssetIdOrWaves(assetIdOrWaves)
+
+  let aToken = Issue(aTokenName, aTokenDescription, 0, aTokenDecimals, true)
+  [
+    aToken,
+    oracleStore.writeString(oracleAddr),
+    aTokenDecimalsStore.writeInt(aTokenDecimals),
+    aTokenNameStore.writeString(aTokenName),
+    assetIdStore.writeString(assetIdOrWaves),
+    configAddressStore.writeString(cfgAddress),
+    aTokenIdStore.writeString(calculateAssetId(aToken).toBase58String()),
+    lastUpdateHeightStore.writeInt(HEIGHT)
+  ]
+}
+
+@Callable(i)
+func userDepositUSD(address: String) = ([], assetToUsd(aTokenToAsset(aTokenBalance(address))))
+
+@Callable(i)
+func userDebtUSD(address: String) = ([], assetToUsd(currentUserDebt(address)))
+
+@Callable(i)
+func userBalance(address: String) = {
+  let atokens = aTokenBalance(address)
+  let asset = aTokenToAsset(atokens)
+  let debt = currentUserDebt(address)
+  (
+    [],
+    (
+      atokens,
+      asset,
+      assetToUsd(asset), #assetUSD
+      debt,
+      assetToUsd(debt), #debtUSD
+      this.getBoolean(useAsCollateralStore(address)).valueOrElse(true)
+    )
+  )
+}
+
+
+@Callable(i)
+func userDebt(address: String) = {
+    let debt = currentUserDebt(address)
+    let debtUsd = assetToUsd(debt)
+    ([], (debt, debtUsd))
+}
+
+@Callable(i)
+func assetUsdValue(assetAmount: Int) = ([], assetToUsd(assetAmount))
+
+
+@Callable(i)
+func repay() = {
+  strict checks = opAllowed("repay")
+  let userAddress = i.caller.toString()
+  let amount = i.paymentAmount(assetId)
+  strict currentDebt = currentUserDebt(userAddress)
+  let (newDebt, totalDebtUpdate, payout, actions) = if (amount > currentDebt)
+        then (                   0, -currentDebt, amount-currentDebt, [ScriptTransfer(i.caller, amount-currentDebt, assetId)])
+        else (currentDebt - amount,      -amount,                  0, [])
+
+  syncTotals(0, totalDebtUpdate, 0, payout) ++ actions ++ [
+    debtStore(userAddress).writeInt(newDebt),
+    debtIndexStore(userAddress).writeInt(currentIndex) ]
+}
+
+@Callable(i)
+func depositFor(depositor: String, useAsCollateral: Boolean) = {
+  strict checks = mainOnly(i) && opAllowed("deposit")
+  if(currentUserDebt(depositor)>0 && !useAsCollateral) then throw("can't disable use as collateral for asset with open debt") else
+  let amount = i.paymentAmount(assetId)
+  let aTokenAmount = assetToAToken(amount)
+
+    syncTotals(amount, 0, 0, 0) ++ [
+         aTokenCirculationStore.changeBy(aTokenAmount),
+         aTokenBalanceStore(depositor).changeBy(aTokenAmount),
+         BooleanEntry(useAsCollateralStore(depositor), useAsCollateral)
+    ]
+}
+
+@Callable(i)
+func replenishWithAtoken() = {
+  strict checks = opAllowed("atokens")
+  let aTokenAmount = i.paymentAmount(aTokenId)
+  let user = i.caller.toString()
+  syncTotals(0,0, 0, 0) ++ [aTokenBalanceStore(user).changeBy(aTokenAmount), Burn(aTokenId, aTokenAmount)] ++ enableColIfNeeded(user)
+}
+
+@Callable(i)
+func borrowFor(address: String, amountToBorrow: Int) = {
+  strict checks = mainOnly(i) && liquidityCheck(amountToBorrow, storedTotalDeposit - storedTotalDebt, "too much borrow requested") && opAllowed("borrow")
+
+ # TODO: can't borrow what's deposited, but can deposit what's borrowed? Explicitly ignored in tests now
+ # if aTokenBalance(address) + getBalance(i.caller, aTokenId) > 0 then
+ # throw("can't borrow same asset as deposited") else
+
+  let newDebt = currentUserDebt(address) + amountToBorrow
+
+  syncTotals(0, amountToBorrow, 0, amountToBorrow) ++ [
+    debtStore(address).writeInt(newDebt),
+    enableCol(address),
+    debtIndexStore(address).writeInt(currentIndex),
+    ScriptTransfer(address.addressFromStringValue(), amountToBorrow, assetId)
+  ]
+}
+
+@Callable(i)
+func mintAtokenFor(address: String, amountToMint: Int) = {
+
+  let userATokenBalance = aTokenBalance(address)
+  let amount = if amountToMint == -1 then userATokenBalance else amountToMint
+
+  strict checks = mainOnly(i)  && opAllowed("atokens")
+  && throwIf(amountToMint < -1, "invalid amountToMint")
+  && throwIf(userATokenBalance < amount, "Trying to mint more than available, max: " + userATokenBalance.toString())
+
+  syncTotals(0,0,0,0) ++ [
+    aTokenBalanceStore(address).changeBy(-amount),
+    Reissue(aTokenId, amount, true),
+    ScriptTransfer(address.addressFromStringValue(), amount, aTokenId)
+  ]
+}
+
+@Callable(i)
+func redeemAtokens() = {
+   strict checks = opAllowed("atokens")
+  let aTokenAmount = i.paymentAmount(aTokenId)
+  let outAmount = aTokenToAsset(aTokenAmount)
+  syncTotals(-outAmount, 0, 0, outAmount) ++ [
+    ScriptTransfer(i.caller, outAmount, assetId),
+    aTokenCirculationStore.changeBy(-aTokenAmount),
+    Burn(aTokenId, aTokenAmount)
+  ]
+}
+
+@Callable(i)
+func withdrawFor(address: String, amount: Int) = {
+    let maxWithdraw = storedTotalDeposit + storedTotalReserve - storedTotalDebt
+    strict checks =
+         mainOnly(i)
+      && liquidityCheck(amount, maxWithdraw, "funds in use")
+      && throwIf(amount < -1, "invalid amount")
+      && opAllowed("withdraw")
+
+    # TODO test this properly
+    let (removedAtokens, withdrawAmount) = if(amount == -1) then
+        let atokens = aTokenBalance(address)
+        (atokens, aTokenToAsset(atokens))
+      else (assetToATokenCeil(amount), amount)
+    syncTotals(-withdrawAmount, 0, 0, withdrawAmount) ++ [
+        ScriptTransfer(address.addressFromStringValue(), withdrawAmount, assetId),
+        aTokenBalanceStore(address).changeBy(-removedAtokens),
+        aTokenCirculationStore.changeBy(-removedAtokens)
+    ]
+}
+
+@Callable(i)
+func transferATokensFor(from: String, to: String, valueUsd: Int) = {
+  strict checks = mainOnly(i) && opAllowed("transfer_debt")
+  let assets = usdToAsset(valueUsd)
+  let atokens = assetToAToken(assets)
+  let aTokensFrom = aTokenBalance(from)
+  if(aTokensFrom < atokens) then throw(
+  "transferAtokensFor error:" +
+    " transfer.valueUsd: " + valueUsd.toString() +
+    " transfer.assets: " + assets.toString() +
+    " transfer.atokens: " + atokens.toString() +
+    " from.atokens: " + aTokensFrom.toString() +
+    " at " + this.toString())
+     else
+  (syncTotals(0, 0, 0, 0) ++ [
+    aTokenBalanceStore(from).changeBy(-atokens),
+    aTokenBalanceStore(to).changeBy(atokens)
+  ] ++ enableColIfNeeded(to), aTokenToAsset(atokens))
+}
+
+@Callable(i)
+func transferDebtFor(from: String, to: String, amount: Int) = {
+  strict checks = mainOnly(i) && opAllowed("transfer_debt")
+  syncTotals(0, 0, 0, 0) ++ [
+    debtStore(from).writeInt(currentUserDebt(from) - amount),
+    debtStore(to).writeInt(currentUserDebt(to) + amount),
+    debtIndexStore(from).writeInt(currentIndex),
+    debtIndexStore(to).writeInt(currentIndex),
+    enableCol(to)
+  ]
+}
+
+@Callable(i)
+func disableUseAsCollateralFor(address: String) = {
+    strict checks = mainOnly(i) && opAllowed("use_as_col")
+    if(currentUserDebt(address) >0) then throw("can't disable collateral for asset with open debt") else
+    syncTotals(0, 0, 0, 0) ++ [ BooleanEntry(useAsCollateralStore(address), false) ]
+}
+
+@Callable(i)
+func enableUseAsCollateral() = {
+    strict checks = opAllowed("use_as_col")
+    syncTotals(0, 0, 0, 0) ++ [ enableCol(i.caller.toString()) ]
+}
+
+@Callable(i)
+func collapseFor(user:String) = {
+    strict checks = mainOnly(i) && opAllowed("force_collapse")
+    collapseUser(user, -1)
+}
+
+@Callable(i)
+func collapseDebt(amount: Int) = {
+    strict checks = opAllowed("collapse")
+    collapseUser(i.caller.toString(), amount)
+}

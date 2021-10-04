@@ -1,0 +1,233 @@
+{-# STDLIB_VERSION 5 #-}
+{-# CONTENT_TYPE DAPP #-}
+{-# SCRIPT_TYPE ACCOUNT #-}
+
+let factorsBase = 1000
+
+func fractionCeil(value: Int, numerator: Int, denominator: Int) = {
+  let cand = fraction(value, numerator, denominator)
+  let D = 3037000499
+  let exact = ((cand % D) * (denominator % D)) % D == ((value % D) * (numerator % D)) % D
+  if(exact) then cand else cand + 1
+}
+
+
+func writeConstString(key: String, value: String) = if !isDefined(getString(this, key)) then StringEntry(key, value) else throw("already initialized: " + key)
+
+func asInt(value: Any) = match value { 
+  case int: Int => int
+  case _ => throw("wrong type, expected: Int")
+}
+
+func asInt2(value: Any) = match value {
+  case x: (Int, Int) => x
+  case t => throw("got something")
+}
+
+func asUserBalanceData(value: Any) = match value {
+  case x: (Int, Int, Int, Int, Int, Boolean) => x
+  case t => throw("expected int5&boolean")
+}
+
+let adminStore = "admin"
+let configStore = "config"
+let reservesStore = "reserves"
+
+### reserve fields
+let aTokenIdStore = "aTokenId"
+let assetIdStore = "assetId"
+###
+
+let admin = this.getStringValue(adminStore).addressFromStringValue()
+let config = this.getStringValue(configStore).addressFromStringValue()
+let reservesStr = this.getString(reservesStore).valueOrErrorMessage("no reserves registered")
+let reserves = reservesStr.split("|")
+
+func assetIdOfReserve(reserve: Address) = reserve.getString(assetIdStore).valueOrErrorMessage("no assetId in reserve")
+
+func collateralFactor(reserve: Address) = config.getInteger(assetIdOfReserve(reserve) + "_CollateralFactor").valueOrErrorMessage("no CollateralFactor in config")
+func liquidationThreshold(reserve: Address) = config.getInteger(assetIdOfReserve(reserve) + "_LiquidationThreshold").valueOrErrorMessage("no LiquidationThreshold in config")
+func liquidationPenalty(assetId: String) = config.getInteger(assetId + "_LiquidationPenalty").valueOrErrorMessage("no LiquidationPenalty in config")
+let accountHealthThreshold = config.getInteger("account_health_threshold").valueOrErrorMessage("no account_health_threshold")
+let accountHealthOverlap = config.getInteger("account_health_overlap").valueOrErrorMessage("no account_health_overlap")
+let collapsePenalty = config.getInteger("collapse_penalty").valueOrErrorMessage("no collapse_penalty")
+
+let liquidators = config.getString("liquidators").valueOrElse("")
+
+func findReserveBy(store: String, value: String) = {
+    func fold(a: Address | Unit, r: String) = {
+      match a {
+        case found: Address => found
+        case _ => {
+          let reserve = r.addressFromString().valueOrErrorMessage("reserve bad address")
+          if reserve.getString(store).valueOrErrorMessage("reserve has no " + store) == value then reserve else unit
+        }
+      }
+    }
+
+    match FOLD<6>(reserves, unit, fold) {
+        case found: Address => found
+        case _ => throw("unknown " + store)
+    }
+}
+
+func validateReserve(r: String) = if(reservesStr.contains(r)) then true else throw("unknown reserve:" + r)
+
+func userBalance(reserve: Address, user: String) = invoke(reserve, "userBalance", [user], []).asUserBalanceData()
+
+func userPower(user: String) = { 
+  func fold(totals: (Int,Int), r: String) = {
+    let (totalD, totalB) = totals
+    let reserve = r.addressFromString().valueOrErrorMessage("reserve bad address")
+    let cf = collateralFactor(reserve)
+    let lt = liquidationThreshold(reserve)
+
+    let (token, asset, depositUsd, debt, debtUsd, asCollateral) = userBalance(reserve, user)
+
+    let effectiveDepositUsd = if(asCollateral) then depositUsd else 0
+    let overlapUsd = min([debtUsd, effectiveDepositUsd])
+    let overlapCharge = fractionCeil(overlapUsd, accountHealthOverlap, factorsBase)
+    if(debtUsd > effectiveDepositUsd)
+      then (totalD, totalB + fraction(debtUsd - effectiveDepositUsd, factorsBase, lt) + overlapCharge)
+      else (totalD + fraction(effectiveDepositUsd - debtUsd, cf, factorsBase), totalB + overlapCharge)
+    }
+    FOLD<6>(reserves, (0,0), fold)
+}
+
+func getUserHealth(account: String) = {
+    let (bp, bpu) = userPower(account).asInt2()
+    "bp:" + bp.toString() + ", bpu:" + bpu.toString()
+}
+func validateAfter(user: String, op: String) = {
+    let (bp, bpu) = userPower(user)
+    let accHealth = ((bp - bpu) * factorsBase) / bp
+    if(bp==0 && bpu==0) then [] else
+    if(bp==0 && bpu>0) then throw(op + " too much: breaching liquidation threshold(bp=0, bpu=" + bpu.toString()) else
+    if(accHealth < accountHealthThreshold) then
+     throw(op + " too much: breaching liquidation threshold(bp=" + bp.toString() +
+        ", bpu=" + bpu.toString() +
+        ", health=" + accHealth.toString() +")")
+        else []
+}
+
+@Callable(i)
+func initialize(configAddress: String) = {
+  [adminStore.writeConstString(i.caller.toString()), configStore.writeConstString(configAddress)]
+}
+
+@Callable(i)
+func registerReserves(addresses: String) = {
+    if(i.caller != admin) then throw("only admin can do") else
+    [StringEntry(reservesStore, addresses)]
+}
+
+@Callable(i)
+func deposit(reserve: String, useAsCollateral: Boolean) = {
+
+    strict v = validateReserve(reserve)
+    let user = i.caller.toString()
+    strict doDeposit = invoke(reserve.addressFromStringValue(), "depositFor", [user, useAsCollateral], i.payments)
+    if(!useAsCollateral) then validateAfter(user, "depositing") else []
+}
+
+@Callable(i)
+func depositRef(reserve: String, useAsCollateral: Boolean, ref: String) = {
+    strict v = validateReserve(reserve)
+    let user = i.caller.toString()
+    strict doDeposit = invoke(reserve.addressFromStringValue(), "depositFor", [user, useAsCollateral], i.payments)
+    if(!useAsCollateral) then validateAfter(user, "depositing") else []
+}
+
+
+@Callable(i)
+func mintAtoken(aTokenId: String, amount: Int) = { # amount in asset, NOT in tokenId, ok for now
+    let user = i.caller.toString()
+    let targetContract = findReserveBy(aTokenIdStore, aTokenId)
+    strict doMint = invoke(targetContract,"mintAtokenFor", [user, amount], [])
+    validateAfter(user, "minting")
+}
+
+@Callable(i)
+func withdraw(assetId: String, amount: Int) = {
+    let user = i.caller.toString()
+    let targetContract = findReserveBy(assetIdStore, assetId)
+    strict doWithdraw = invoke(targetContract,"withdrawFor", [user, amount], [])
+    validateAfter(user, "withdrawing")
+}
+
+@Callable(i)
+func withdraw2(reserve: String, amount: Int) = {
+    strict v = validateReserve(reserve)
+    let user = i.caller.toString()
+    let targetContract = reserve.addressFromStringValue()
+    strict doWithdraw = invoke(targetContract,"withdrawFor", [user, amount], [])
+    validateAfter(user, "withdrawing2")
+}
+
+@Callable(i)
+func borrow(assetId: String, amount: Int) = {
+    let user = i.caller.toString()
+    let targetContract = findReserveBy(assetIdStore, assetId)
+    strict doBorrow = invoke(targetContract,"borrowFor", [user, amount], [])
+    validateAfter(user, "borrowing")
+}
+
+@Callable(i)
+func borrow2(reserve: String, amount: Int) = {
+    strict v = validateReserve(reserve)
+    let user = i.caller.toString()
+    let targetContract = reserve.addressFromString().valueOrErrorMessage("bad reserve address")
+    strict doBorrow = invoke(targetContract,"borrowFor", [user, amount], [])
+    validateAfter(user, "borrowing2")
+}
+
+@Callable(i)
+func disableUseAsCollateral(reserve: String) = {
+    strict v = validateReserve(reserve)
+    let user = i.caller.toString()
+    strict doSetCollateral = invoke(addressFromString(reserve).valueOrErrorMessage("bad reserve"),"disableUseAsCollateralFor", [user], [])
+    validateAfter(user, "changing collateral status")
+}
+
+@Callable(i)
+func transferDebt(borrowReserve: String, collateralReserve: String, borrower: String, liquidateDebtAmount: Int) = {
+  strict v = validateReserve(borrowReserve) && validateReserve(collateralReserve)
+  if(liquidateDebtAmount <= 0) then throw("can't liquidate non-positive amount") else
+  if(collateralReserve == borrowReserve) then throw("collateralReserve equals borrowReserve") else
+  let liquidator = i.caller.toString()
+  if(liquidator == borrower) then throw("can't liquidate self") else
+  let (bp, bpu) = userPower(borrower)
+  if (bp > bpu) then throw("can't liquidate healthy user: u=" + borrower + ", bp=" + bp.toString() + ", bpu=" + bpu.toString()) else
+  let br = borrowReserve.addressFromStringValue()
+  let cr = collateralReserve.addressFromStringValue()
+  let borrowAsset = br.getString("assetId").valueOrErrorMessage("no assetId field in borrowReserve " + borrowReserve)
+  strict isCollateral = cr.getBoolean(borrower + "_useAsCollateral").valueOrElse(false)
+  if(!isCollateral) then throw("can't liquidate deposit not used as collateral") else
+  strict (ignore, userAsset, userAssetUsd, userDebt, userDebtUsd) = br.userBalance(borrower)
+  if(userAsset >= userDebt) then throw("can't liquidate debt of asset of positive saldo") else
+  if liquidateDebtAmount <= 0 then throw("can't liquidate zero or negative amount") else
+  if liquidateDebtAmount * 2 > (userDebt - userAsset) then throw("can't liquidate more than half of saldo: debt=" + userDebt.toString() + ", deposit=" + userAsset.toString() + ", liquidateDebtAmount = " + liquidateDebtAmount.toString()) else
+  let collateralUsd = fraction(liquidateDebtAmount, userDebtUsd, userDebt) # debts are ok in this calc, since it's just to calc usd
+  let penaltizedUsd = fraction(collateralUsd, factorsBase + liquidationPenalty(borrowAsset), factorsBase)
+  strict transferCollateral = cr.invoke("transferATokensFor", [borrower, liquidator, penaltizedUsd], []).asInt()
+  strict transferDebt = br.invoke("transferDebtFor", [borrower, liquidator, liquidateDebtAmount], [])
+
+  strict liquidatorHealthCheck = if(liquidators.contains(liquidator)) then [] else validateAfter(liquidator, "transferring debt")
+  (liquidatorHealthCheck, transferCollateral)
+}
+
+@Callable(i)
+func forceCollapse(reserve: String, borrower: String) = {
+   strict v = validateReserve(reserve)
+   let liquidator = i.caller.toString()
+    if(liquidator == borrower) then throw("can't collapse self in this function") else
+    let (bp, bpu) = userPower(borrower)
+    if (bp > bpu) then throw("can't force collapse healthy user: u=" + borrower + ", bp=" + bp.toString() + ", bpu=" + bpu.toString()) else
+    let reserveAddress = reserve.addressFromStringValue()
+    strict (ignore, userAsset, userAssetUsd, userDebt, userDebtUsd) = reserveAddress.userBalance(borrower)
+    let penaltizedUsd = fraction(min([userAssetUsd, userDebtUsd]), collapsePenalty, factorsBase)
+    # charge collapse penalty
+    strict bonus = reserveAddress.invoke("transferATokensFor", [borrower, liquidator, penaltizedUsd], [])
+    strict collapse = reserveAddress.invoke("collapseFor", [borrower], [])
+    []
+}
